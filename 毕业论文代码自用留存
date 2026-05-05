@@ -1,0 +1,357 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import semopy
+from semopy import Model
+import statsmodels.api as sm
+from sklearn.utils import resample
+from scipy.stats import f_oneway
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+# -------------------- 读取数据 --------------------
+file_path = "black_myth_survey_cleaned.csv"
+df = pd.read_csv(file_path)
+
+# -------------------- 量表题项定义 --------------------
+scale_items = {
+    'GE': ['GE1','GE2','GE3','GE4'],
+    'CS': ['CS1','CS2','CS3'],
+    'CI': ['CI1','CI2','CI3','CI4'],
+    'NOS': ['NOS1','NOS2','NOS3'],
+    'COG': ['COG1','COG2','COG3'],
+    'AFF': ['AFF1','AFF2','AFF3'],
+    'RISK': ['RISK1','RISK2','RISK3'],
+    'RES': ['RES1','RES2','RES3','RES4'],
+    'GAP': ['GAP1','GAP2','GAP3'],
+    'TI': ['TI1','TI2','TI3'],
+    'REC': ['REC1','REC2']
+}
+# 计算各量表均值 (若列缺失则跳过)
+for name, items in scale_items.items():
+    exist_items = [it for it in items if it in df.columns]
+    if exist_items and f'{name}_mean' not in df.columns:
+        df[f'{name}_mean'] = df[exist_items].mean(axis=1, skipna=True)
+
+# ==================== 1. 信度分析 (Cronbach's α) ====================
+def cronbach_alpha(df, items):
+    df_items = df[items].dropna()
+    if df_items.shape[1] < 2:
+        return np.nan
+    item_variances = df_items.var(axis=0, ddof=1)
+    total_var = df_items.sum(axis=1).var(ddof=1)
+    k = len(items)
+    return (k / (k - 1)) * (1 - item_variances.sum() / total_var)
+
+reliability_results = []
+for name, items in scale_items.items():
+    existing_items = [it for it in items if it in df.columns]
+    if len(existing_items) < 2:
+        alpha = np.nan
+    else:
+        alpha = cronbach_alpha(df, existing_items)
+    reliability_results.append({
+        '量表': name,
+        '题项数': len(existing_items),
+        'Cronbach_alpha': round(alpha, 3) if not np.isnan(alpha) else '缺失'
+    })
+reliability_df = pd.DataFrame(reliability_results)
+print("\n========== 信度分析 (Cronbach's α) ==========")
+print(reliability_df.to_string(index=False))
+reliability_df.to_csv("信度分析结果.csv", index=False, encoding='utf-8-sig')
+
+# ==================== 2. 描述统计与相关矩阵 ====================
+mean_cols = [f'{k}_mean' for k in scale_items.keys() if f'{k}_mean' in df.columns]
+extra_vars = ['Age', 'GameHoursPerWeek']
+corr_vars = mean_cols + [v for v in extra_vars if v in df.columns]
+
+desc_stats = df[corr_vars].describe().loc[['mean', 'std']].T
+desc_stats.columns = ['均值', '标准差']
+desc_stats = desc_stats.round(3)
+print("\n========== 描述统计 ==========")
+print(desc_stats)
+desc_stats.to_csv("描述统计.csv", encoding='utf-8-sig')
+
+# Pearson相关矩阵 (带显著性标记)
+n_var = len(corr_vars)
+corr_mat = pd.DataFrame(np.ones((n_var, n_var)), index=corr_vars, columns=corr_vars)
+p_mat = pd.DataFrame(np.ones((n_var, n_var)), index=corr_vars, columns=corr_vars)
+for i, v1 in enumerate(corr_vars):
+    for j, v2 in enumerate(corr_vars):
+        if i == j:
+            corr_mat.iloc[i, j] = 1.0
+            p_mat.iloc[i, j] = 0.0
+        else:
+            df_pair = df[[v1, v2]].dropna()
+            if len(df_pair) > 2:
+                r, p = stats.pearsonr(df_pair[v1], df_pair[v2])
+                corr_mat.iloc[i, j] = r
+                p_mat.iloc[i, j] = p
+
+corr_with_stars = corr_mat.copy().astype(str)
+for i in range(n_var):
+    for j in range(n_var):
+        if i == j:
+            corr_with_stars.iloc[i, j] = "1"
+        else:
+            r = corr_mat.iloc[i, j]
+            p = p_mat.iloc[i, j]
+            star = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else ''
+            corr_with_stars.iloc[i, j] = f"{r:.3f}{star}"
+
+print("\n========== Pearson 相关矩阵 (带显著性标记) ==========")
+print(corr_with_stars.to_string())
+corr_with_stars.to_csv("相关矩阵_带星号.csv", encoding='utf-8-sig')
+corr_mat.round(3).to_csv("相关矩阵_数值.csv", encoding='utf-8-sig')
+
+# ==================== 3. CFA (semopy) 与 拟合指数 ====================
+cfa_spec = """
+    GE =~ GE1 + GE2 + GE3 + GE4
+    CS =~ CS1 + CS2 + CS3
+    CI =~ CI1 + CI2 + CI3 + CI4
+    NOS =~ NOS1 + NOS2 + NOS3
+    COG =~ COG1 + COG2 + COG3
+    AFF =~ AFF1 + AFF2 + AFF3
+    RISK =~ RISK1 + RISK2 + RISK3
+    RES =~ RES1 + RES2 + RES3 + RES4
+    GAP =~ GAP1 + GAP2 + GAP3
+    TI =~ TI1 + TI2 + TI3
+    REC =~ REC1 + REC2
+"""
+all_items = [item for items in scale_items.values() for item in items]
+df_cfa = df[all_items].dropna()
+print(f"\nCFA 样本量: {len(df_cfa)}")
+
+model = Model(cfa_spec)
+model.fit(df_cfa)
+params = model.inspect()
+
+loadings = params[params['op'] == '~'].copy()
+factors = list(scale_items.keys())
+factor_var = {}
+for fac in factors:
+    mask = (params['lval'] == fac) & (params['op'] == '~~') & (params['rval'] == fac)
+    factor_var[fac] = params.loc[mask, 'Estimate'].values[0] if mask.any() else 1.0
+
+loadings['std_est'] = loadings.apply(
+    lambda row: row['Estimate'] / np.sqrt(factor_var.get(row['lval'], 1.0)),
+    axis=1
+)
+
+print("\n===== 标准化因子载荷 (CFA) =====")
+for _, row in loadings.iterrows():
+    print(f"{row['lval']} → {row['rval']}: {row['std_est']:.4f}")
+
+loadings_dict = dict(zip(loadings['rval'], loadings['std_est']))
+
+def cr_ave(loadings_dict, items):
+    loads = [loadings_dict[item] for item in items if item in loadings_dict]
+    if len(loads) == 0:
+        return None, None
+    sum_l = sum(loads)
+    sum_l2 = sum(l**2 for l in loads)
+    k = len(loads)
+    cr = (sum_l**2) / (sum_l**2 + (k - sum_l2))
+    ave = sum_l2 / k
+    return cr, ave
+
+print("\n===== 组合信度 (CR) 与 平均方差抽取量 (AVE) [CFA] =====")
+cr_ave_results = []
+for fac in factors:
+    cr, ave = cr_ave(loadings_dict, scale_items[fac])
+    if cr is not None:
+        print(f"{fac}: CR = {cr:.3f}, AVE = {ave:.3f}")
+        cr_ave_results.append({'因子': fac, 'CR': cr, 'AVE': ave})
+pd.DataFrame(cr_ave_results).to_csv("CFA_CR_AVE.csv", index=False)
+loadings[['lval','rval','std_est']].to_csv("CFA_标准化载荷.csv", index=False)
+
+stats_cfa = semopy.calc_stats(model)
+print("\n===== 模型拟合指数 =====")
+for key in ['chi2', 'df', 'p_value', 'cfi', 'tli', 'rmsea', 'srmr']:
+    if key in stats_cfa:
+        val = stats_cfa[key]
+        print(f"{key}: {val:.4f}" if isinstance(val, (float, int)) else f"{key}: {val}")
+
+# ==================== 4. 手动计算 CR & AVE (基于固定载荷) ====================
+fixed_loadings = {
+    'GE1': 1.0000, 'GE2': 1.0490, 'GE3': 0.9722, 'GE4': 1.0091,
+    'CS1': 1.0000, 'CS2': 0.8749, 'CS3': 0.9709,
+    'CI1': 1.0000, 'CI2': 0.9880, 'CI3': 1.0203, 'CI4': 1.0249,
+    'NOS1': 1.0000, 'NOS2': -0.9841, 'NOS3': 1.0302,
+    'COG1': 1.0000, 'COG2': 1.0611, 'COG3': 1.0825,
+    'AFF1': 1.0000, 'AFF2': 0.8866, 'AFF3': 0.9988,
+    'RISK1': 1.0000, 'RISK2': 1.0068, 'RISK3': 0.9105,
+    'RES1': 1.0000, 'RES2': 1.0258, 'RES3': 1.0271, 'RES4': 1.0466,
+    'GAP1': 1.0000, 'GAP2': 1.0371, 'GAP3': 0.9476,
+    'TI1': 1.0000, 'TI2': 1.0618, 'TI3': 0.9913,
+    'REC1': 1.0000, 'REC2': 0.9948
+}
+
+print("\n===== 组合信度 (CR) 与 平均方差抽取量 (AVE) [手动载荷] =====")
+manual_results = []
+for fac in factors:
+    items = scale_items[fac]
+    loads = [fixed_loadings[item] for item in items if item in fixed_loadings]
+    if not loads:
+        continue
+    sum_load = sum(loads)
+    sum_load_sq = sum(l**2 for l in loads)
+    k = len(loads)
+    error_var = sum(1 - l**2 for l in loads)
+    cr = (sum_load**2) / (sum_load**2 + error_var)
+    ave = sum_load_sq / k
+    print(f"{fac}: CR = {cr:.3f}, AVE = {ave:.3f}")
+    manual_results.append({'因子': fac, 'CR': cr, 'AVE': ave})
+pd.DataFrame(manual_results).to_csv("CFA_CR_AVE_手动计算.csv", index=False)
+
+# ==================== 5. 中介效应 Bootstrap ====================
+core_vars = [f'{k}_mean' for k in ['GE','CS','CI','NOS','COG','AFF','RISK','RES','GAP','TI']]
+df_clean = df[core_vars].dropna()
+print(f"\nSEM 路径分析样本量: {len(df_clean)}")
+
+print("\n===== 路径系数 (OLS) =====")
+model_ci = sm.OLS(df_clean['CI_mean'], sm.add_constant(df_clean['GE_mean'])).fit()
+print(f"CI ← GE: b = {model_ci.params['GE_mean']:.4f}, p = {model_ci.pvalues['GE_mean']:.4f}")
+model_cog = sm.OLS(df_clean['COG_mean'], sm.add_constant(df_clean['CS_mean'])).fit()
+print(f"COG ← CS: b = {model_cog.params['CS_mean']:.4f}, p = {model_cog.pvalues['CS_mean']:.4f}")
+model_aff = sm.OLS(df_clean['AFF_mean'], sm.add_constant(df_clean['COG_mean'])).fit()
+print(f"AFF ← COG: b = {model_aff.params['COG_mean']:.4f}, p = {model_aff.pvalues['COG_mean']:.4f}")
+model_gap = sm.OLS(df_clean['GAP_mean'], sm.add_constant(df_clean['GE_mean'])).fit()
+print(f"GAP ← GE: b = {model_gap.params['GE_mean']:.4f}, p = {model_gap.pvalues['GE_mean']:.4f}")
+
+X_ti = sm.add_constant(df_clean[['GE_mean','CI_mean','AFF_mean','GAP_mean','CS_mean']])
+model_ti = sm.OLS(df_clean['TI_mean'], X_ti).fit()
+print(f"TI ← GE: b = {model_ti.params['GE_mean']:.4f}, p = {model_ti.pvalues['GE_mean']:.4f}")
+print(f"TI ← CI: b = {model_ti.params['CI_mean']:.4f}, p = {model_ti.pvalues['CI_mean']:.4f}")
+print(f"TI ← AFF: b = {model_ti.params['AFF_mean']:.4f}, p = {model_ti.pvalues['AFF_mean']:.4f}")
+print(f"TI ← GAP: b = {model_ti.params['GAP_mean']:.4f}, p = {model_ti.pvalues['GAP_mean']:.4f}")
+print(f"TI ← CS: b = {model_ti.params['CS_mean']:.4f}, p = {model_ti.pvalues['CS_mean']:.4f}")
+print(f"R² = {model_ti.rsquared:.3f}")
+
+n_boot = 5000
+np.random.seed(12345)
+indirect_GE_CI_TI = []
+indirect_CS_COG_AFF_TI = []
+indirect_GE_GAP_TI = []
+
+for _ in range(n_boot):
+    boot_idx = np.random.choice(len(df_clean), size=len(df_clean), replace=True)
+    boot_data = df_clean.iloc[boot_idx]
+    try:
+        b_ci_ge = sm.OLS(boot_data['CI_mean'], sm.add_constant(boot_data['GE_mean'])).fit().params['GE_mean']
+    except:
+        b_ci_ge = np.nan
+    try:
+        b_cog_cs = sm.OLS(boot_data['COG_mean'], sm.add_constant(boot_data['CS_mean'])).fit().params['CS_mean']
+    except:
+        b_cog_cs = np.nan
+    try:
+        b_aff_cog = sm.OLS(boot_data['AFF_mean'], sm.add_constant(boot_data['COG_mean'])).fit().params['COG_mean']
+    except:
+        b_aff_cog = np.nan
+    try:
+        b_gap_ge = sm.OLS(boot_data['GAP_mean'], sm.add_constant(boot_data['GE_mean'])).fit().params['GE_mean']
+    except:
+        b_gap_ge = np.nan
+    try:
+        X_ti_boot = sm.add_constant(boot_data[['CI_mean','AFF_mean','GAP_mean']])
+        ti_coef = sm.OLS(boot_data['TI_mean'], X_ti_boot).fit().params
+        b_ti_ci = ti_coef.get('CI_mean', np.nan)
+        b_ti_aff = ti_coef.get('AFF_mean', np.nan)
+        b_ti_gap = ti_coef.get('GAP_mean', np.nan)
+    except:
+        b_ti_ci = b_ti_aff = b_ti_gap = np.nan
+    if not np.isnan(b_ci_ge) and not np.isnan(b_ti_ci):
+        indirect_GE_CI_TI.append(b_ci_ge * b_ti_ci)
+    if not np.isnan(b_cog_cs) and not np.isnan(b_aff_cog) and not np.isnan(b_ti_aff):
+        indirect_CS_COG_AFF_TI.append(b_cog_cs * b_aff_cog * b_ti_aff)
+    if not np.isnan(b_gap_ge) and not np.isnan(b_ti_gap):
+        indirect_GE_GAP_TI.append(b_gap_ge * b_ti_gap)
+
+def ci_bootstrap(arr, alpha=0.05):
+    arr = np.array(arr)
+    lower = np.percentile(arr, 100*alpha/2)
+    upper = np.percentile(arr, 100*(1-alpha/2))
+    return lower, upper
+
+print("\n===== Bootstrap 中介效应 (5000次) =====")
+if len(indirect_GE_CI_TI) > 0:
+    lower, upper = ci_bootstrap(indirect_GE_CI_TI)
+    mean_eff = np.mean(indirect_GE_CI_TI)
+    print(f"间接效应 GE → CI → TI: 均值 = {mean_eff:.4f}, 95% CI = [{lower:.4f}, {upper:.4f}]")
+if len(indirect_CS_COG_AFF_TI) > 0:
+    lower, upper = ci_bootstrap(indirect_CS_COG_AFF_TI)
+    mean_eff = np.mean(indirect_CS_COG_AFF_TI)
+    print(f"间接效应 CS → COG → AFF → TI: 均值 = {mean_eff:.4f}, 95% CI = [{lower:.4f}, {upper:.4f}]")
+if len(indirect_GE_GAP_TI) > 0:
+    lower, upper = ci_bootstrap(indirect_GE_GAP_TI)
+    mean_eff = np.mean(indirect_GE_GAP_TI)
+    print(f"间接效应 GE → GAP → TI: 均值 = {mean_eff:.4f}, 95% CI = [{lower:.4f}, {upper:.4f}]")
+
+# ==================== 6. 方差分析 / 多群组比较 / 调节效应 ====================
+df_group = df[['PlayerType','GE_mean','CI_mean','AFF_mean','GAP_mean','CS_mean','COG_mean','TI_mean']].dropna()
+df_group['TypeLabel'] = df_group['PlayerType'].map({1:'休闲玩家',2:'核心玩家',3:'硬核玩家'})
+groups = [1,2,3]
+group_names = ['休闲玩家','核心玩家','硬核玩家']
+
+groups_ti = [df_group[df_group['PlayerType']==g]['TI_mean'].dropna() for g in groups]
+f_stat, p_val = f_oneway(*groups_ti)
+print("\n===== 不同玩家类型在旅游意愿上的差异 (ANOVA) =====")
+print(f"F = {f_stat:.3f}, p = {p_val:.4f}")
+if p_val < 0.05:
+    print("不同玩家类型之间的旅游意愿存在显著差异，事后检验 (Tukey HSD)：")
+    tukey = pairwise_tukeyhsd(df_group['TI_mean'], df_group['TypeLabel'], alpha=0.05)
+    print(tukey)
+else:
+    print("不同玩家类型之间的旅游意愿无显著差异。")
+
+coefs, ses = [], []
+print("\n===== 各玩家类型回归 (TI = GE + CI + AFF) =====")
+for g, name in zip(groups, group_names):
+    sub = df_group[df_group['PlayerType']==g]
+    X = sm.add_constant(sub[['GE_mean','CI_mean','AFF_mean']])
+    y = sub['TI_mean']
+    model_g = sm.OLS(y, X).fit()
+    print(f"\n{name} (N={len(sub)}): GE系数 = {model_g.params['GE_mean']:.4f}, p = {model_g.pvalues['GE_mean']:.4f}")
+    coefs.append(model_g.params['GE_mean'])
+    ses.append(model_g.bse['GE_mean'])
+
+print("\n===== 组间系数差异检验 (GE -> TI) =====")
+for i in range(len(groups)):
+    for j in range(i+1, len(groups)):
+        b1, b2 = coefs[i], coefs[j]
+        se1, se2 = ses[i], ses[j]
+        if np.isnan(b1) or np.isnan(b2): continue
+        z = (b1 - b2) / np.sqrt(se1**2 + se2**2)
+        p = 2 * (1 - stats.norm.cdf(abs(z)))
+        print(f"{group_names[i]} vs {group_names[j]}: z = {z:.3f}, p = {p:.4f}")
+
+reg_vars = ['GE_mean','TI_mean','RISK_mean','RES_mean']
+df_reg = df[reg_vars].dropna()
+df_reg['GE_c'] = df_reg['GE_mean'] - df_reg['GE_mean'].mean()
+df_reg['RISK_c'] = df_reg['RISK_mean'] - df_reg['RISK_mean'].mean()
+df_reg['RES_c'] = df_reg['RES_mean'] - df_reg['RES_mean'].mean()
+
+df_reg['GE_RISK'] = df_reg['GE_c'] * df_reg['RISK_c']
+model_risk = sm.OLS(df_reg['TI_mean'], sm.add_constant(df_reg[['GE_c','RISK_c','GE_RISK']])).fit()
+print("\n===== 调节效应：风险感知 (GE × RISK → TI) =====")
+print(f"交互项系数 = {model_risk.params['GE_RISK']:.4f}, p = {model_risk.pvalues['GE_RISK']:.4f}")
+if model_risk.pvalues['GE_RISK'] < 0.05:
+    print("风险感知显著调节 GE→TI 路径。")
+    risk_mean = df_reg['RISK_mean'].mean()
+    risk_sd = df_reg['RISK_mean'].std()
+    b_ge = model_risk.params['GE_c']
+    b_int = model_risk.params['GE_RISK']
+    slope_low = b_ge + b_int * (-risk_sd)   # 低风险 (-1SD)
+    slope_high = b_ge + b_int * (risk_sd)   # 高风险 (+1SD)
+    print(f"简单斜率：低风险感知组 = {slope_low:.4f}, 高风险感知组 = {slope_high:.4f}")
+else:
+    print("风险感知的调节效应不显著。")
+
+df_reg['GE_RES'] = df_reg['GE_c'] * df_reg['RES_c']
+model_res = sm.OLS(df_reg['TI_mean'], sm.add_constant(df_reg[['GE_c','RES_c','GE_RES']])).fit()
+print("\n===== 调节效应：心理韧性 (GE × RES → TI) =====")
+print(f"交互项系数 = {model_res.params['GE_RES']:.4f}, p = {model_res.pvalues['GE_RES']:.4f}")
+if model_res.pvalues['GE_RES'] < 0.05:
+    print("心理韧性显著调节 GE→TI 路径。")
+else:
+    print("心理韧性的调节效应不显著。")
