@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 1. 数据读取与预处理 ====================
-df = pd.read_csv("black_myth_survey.csv")
+df = pd.read_csv("black_myth_survey_cleaned.csv")
 print(f"原始数据行数: {len(df)}")
 
 # 反向计分处理
